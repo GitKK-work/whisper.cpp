@@ -77,6 +77,11 @@ jobs:
           grep -E "WHISPER_BUILD_SERVER|GGML_CUDA|CMAKE_CUDA_ARCHITECTURES" build/CMakeCache.txt || true
 
       - name: Build
+        env:
+          # CUDA 容器没 driver，链接可执行文件时需要 stub libcuda.so
+          # 运行时 Kaggle 有真 driver，无影响
+          LIBRARY_PATH: /usr/local/cuda/lib64/stubs
+          LD_LIBRARY_PATH: /usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}
         run: |
           set -e
           cmake --build build -j "$(nproc)" --config Release
