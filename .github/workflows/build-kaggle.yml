@@ -45,7 +45,7 @@ jobs:
           FULL_SHA: ${{ github.sha }}
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
-          echo "SHORT=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "SHORT=$(echo "$FULL_SHA" | cut -c1-7)" >> "$GITHUB_OUTPUT"
           echo "DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
           echo "UPSTREAM=$REPO_URL" >> "$GITHUB_OUTPUT"
       - name: Install build deps
