@@ -41,11 +41,13 @@ jobs:
 
       - name: Record commit info
         id: meta
+        env:
+          FULL_SHA: ${{ github.sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
-          echo "SHORT=$(git rev-parse --short HEAD)"          >> "$GITHUB_OUTPUT"
-          echo "DATE=$(git log -1 --format=%cd --date=short)" >> "$GITHUB_OUTPUT"
-          echo "UPSTREAM=$(git config --get remote.origin.url)" >> "$GITHUB_OUTPUT"
-
+          echo "SHORT=${FULL_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "DATE=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+          echo "UPSTREAM=$REPO_URL" >> "$GITHUB_OUTPUT"
       - name: Install build deps
         env:
           DEBIAN_FRONTEND: noninteractive
