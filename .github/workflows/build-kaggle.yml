@@ -1,0 +1,199 @@
+name: Build whisper.cpp for Kaggle
+
+# 触发：
+#   1. 手动 workflow_dispatch（脚本里 gh workflow run 走这条）
+#   2. push tag 'kaggle-v*'
+#   3. release published
+on:
+  workflow_dispatch:
+    inputs:
+      cuda_arch:
+        description: 'CUDA compute capability (T4=75, L4=89, A100=80, H100=90)'
+        required: false
+        default: '75'
+      publish_release:
+        description: 'Also publish as GitHub Release'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+  push:
+    tags: ['kaggle-v*']
+  release:
+    types: [published]
+
+permissions:
+  contents: write   # 发 Release 需要
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    container:
+      image: nvidia/cuda:12.1.0-devel-ubuntu22.04
+      options: --user root
+
+    steps:
+      # 直接 checkout 当前 fork；ref 用 SHA 保证和触发事件一致
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Record commit info
+        id: meta
+        run: |
+          echo "SHORT=$(git rev-parse --short HEAD)"          >> "$GITHUB_OUTPUT"
+          echo "DATE=$(git log -1 --format=%cd --date=short)" >> "$GITHUB_OUTPUT"
+          echo "UPSTREAM=$(git config --get remote.origin.url)" >> "$GITHUB_OUTPUT"
+
+      - name: Install build deps
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -e
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            cmake build-essential ccache zip jq ca-certificates
+          rm -rf /var/lib/apt/lists/*
+          echo "=== nvcc ==="  && nvcc --version
+          echo "=== cmake ===" && cmake --version | head -1
+          echo "=== nproc ===" && nproc
+
+      - name: Configure CMake
+        env:
+          ARCH: ${{ github.event.inputs.cuda_arch || '75' }}
+        run: |
+          set -e
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DGGML_NATIVE=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="${ARCH}" \
+            -DWHISPER_BUILD_EXAMPLES=ON \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_SERVER=ON \
+            -DBUILD_SHARED_LIBS=ON
+          echo "--- CMake cache check ---"
+          grep -E "WHISPER_BUILD_SERVER|GGML_CUDA|CMAKE_CUDA_ARCHITECTURES" build/CMakeCache.txt || true
+
+      - name: Build
+        run: |
+          set -e
+          cmake --build build -j "$(nproc)" --config Release
+          echo "=== build/bin ===" && ls -la build/bin/ || true
+          echo "=== .so files ===" && find build -name 'lib*.so*' | sort
+
+      - name: Verify binary
+        run: |
+          set -e
+          test -x build/bin/whisper-server || { echo "❌ whisper-server missing"; exit 1; }
+          echo "=== ldd (CUDA/ggml/whisper) ==="
+          ldd build/bin/whisper-server | grep -Ei "cuda|cublas|whisper|ggml" || true
+          echo "=== --help (first 20 lines) ==="
+          ./build/bin/whisper-server --help 2>&1 | head -20 || true
+
+      - name: Package
+        id: pkg
+        env:
+          ARCH:  ${{ github.event.inputs.cuda_arch || '75' }}
+          SHORT: ${{ steps.meta.outputs.short }}
+          DATE:  ${{ steps.meta.outputs.date }}
+          UPSTREAM: ${{ steps.meta.outputs.upstream }}
+        run: |
+          set -e
+          mkdir -p pkg
+          cp build/bin/whisper-server pkg/
+          chmod 755 pkg/whisper-server
+          find build -name 'libggml*.so*'    -exec cp {} pkg/ \;
+          find build -name 'libwhisper*.so*' -exec cp {} pkg/ \;
+          # CUDA 运行时（Kaggle 镜像有 driver 但不一定有 cublas/nvrtc）
+          for lib in libcublas.so libcublasLt.so libcudart.so \
+                     libnvrtc.so libnvJitLink.so libcufft.so libcurand.so; do
+            find /usr/local/cuda/lib64 -maxdepth 1 -name "${lib}*" -exec cp {} pkg/ \; 2>/dev/null || true
+          done
+          CUDA_TOOLKIT=$(nvcc --version | grep -oE 'release [0-9.]+' | awk '{print $2}')
+          cat > pkg/version.json <<EOF
+          {
+            "whisper_cpp_commit": "${SHORT}",
+            "commit_date":        "${DATE}",
+            "cuda_arch":          "sm_${ARCH}",
+            "cuda_toolkit":       "${CUDA_TOOLKIT}",
+            "upstream":           "${UPSTREAM}",
+            "built_by":           "github-actions",
+            "workflow_run":       "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          }
+          EOF
+          cat pkg/version.json
+          ZIP_NAME="whisper-cpp-${SHORT}-sm${ARCH}.zip"
+          (cd pkg && zip -qr "../${ZIP_NAME}" .)
+          cp "../${ZIP_NAME}" "$GITHUB_WORKSPACE/"
+          echo "zip_name=${ZIP_NAME}" >> "$GITHUB_OUTPUT"
+          ls -la "$GITHUB_WORKSPACE/${ZIP_NAME}"
+
+      - name: Upload workflow artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.zip_name }}
+          path: whisper-cpp-*.zip
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Compute release tag
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true'
+        id: tag
+        env:
+          SHORT: ${{ steps.meta.outputs.short }}
+          ARCH:  ${{ github.event.inputs.cuda_arch || '75' }}
+        run: |
+          TAG="kaggle-sm${ARCH}-${SHORT}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release + attach zip
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG:      ${{ steps.tag.outputs.tag }}
+          ZIP_NAME: ${{ steps.pkg.outputs.zip_name }}
+          ARCH:     ${{ github.event.inputs.cuda_arch || '75' }}
+          SHORT:    ${{ steps.meta.outputs.short }}
+          DATE:     ${{ steps.meta.outputs.date }}
+        run: |
+          set -e
+          gh release create "$TAG" \
+            --title "whisper.cpp ${SHORT} (sm_${ARCH})" \
+            --notes "Auto-built for Kaggle T4.
+          - **Commit**: ${SHORT} (${DATE})
+          - **CUDA arch**: sm_${ARCH}
+          - **CUDA toolkit**: $(nvcc --version | grep -oE 'release [0-9.]+' | awk '{print $2}')
+          - **Workflow run**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          ## Kaggle Dataset 上传
+          1. Download \`${ZIP_NAME}\` from Assets below
+          2. Either upload manually at https://www.kaggle.com/datasets (slug: \`whisper-cpp-bin\`)
+          3. Or run \`scripts/build-and-publish.sh\` locally — it auto-uploads
+          " \
+            --target "$GITHUB_SHA" \
+            "${ZIP_NAME}"
+
+      - name: Write job summary
+        if: always()
+        env:
+          ZIP_NAME: ${{ steps.pkg.outputs.zip_name }}
+          TAG:      ${{ steps.tag.outputs.tag }}
+          ARCH:     ${{ github.event.inputs.cuda_arch || '75' }}
+          SHORT:    ${{ steps.meta.outputs.short }}
+          DATE:     ${{ steps.meta.outputs.date }}
+        run: |
+          {
+            echo "## whisper.cpp build ✅"
+            echo ""
+            echo "- **Commit**: \`${SHORT}\` (${DATE})"
+            echo "- **CUDA arch**: sm_${ARCH}"
+            echo "- **Artifact**: \`${ZIP_NAME}\` (90-day retention)"
+            [ -n "$TAG" ] && echo "- **Release**: [$TAG](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG})"
+            echo ""
+            echo "### Next steps"
+            echo "1. Download the zip (artifact above or from Release)"
+            echo "2. Either upload manually to Kaggle Datasets as \`whisper-cpp-bin\`"
+            echo "3. Or run \`scripts/build-and-publish.sh\` locally — it auto-uploads"
+          } >> "$GITHUB_STEP_SUMMARY"
